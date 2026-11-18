@@ -9,11 +9,12 @@ Built 2026-11-19 (Asia/Jakarta) against the official kit in
 
 A GitHub-compatible git forge as a single Node process, standard library only
 (`node:http`, `node:zlib`, `node:crypto`), no dependencies, no git binary, all state in memory.
-The starter's `main.ts` lifecycle is byte-identical to the kit's; the server is new:
+The server was new from the start; `main.ts` began as the kit starter's lifecycle and was later
+rewritten by hand (see "Post-build fix" below) with its contract unchanged:
 
 | File | Role |
 | --- | --- |
-| `main.ts` | Harness lifecycle (kit starter, unchanged): bind port 0, POST `/register`, poll `/done`, exit 0 |
+| `main.ts` | Harness lifecycle (agent-written, contract identical to the starter): bind port 0, POST `/register`, poll `/done`, exit 0 |
 | `app.ts` | HTTP wiring: bearer-token gate (`MAKEFUN_SHOP_TOKEN`), `X-GitHub-Request-Id` on every reply, routing, 500-proofing |
 | `store.ts` | Shared core: SHA-1 object store, trees/commits, ancestry + merge-base, three-way tree merge, repos/issues/PRs/labels/comments, LCS line diffs |
 | `gitproto.ts` | Git smart HTTP: pkt-lines, pack write (plain) + pack read (plain, OFS/REF deltas, trailer verified), protocol v2 advertisement/ls-refs/fetch with shallow + deepen, v0 fetch fallback, receive-pack v0 with report-status in side-band-64k, fast-forward-only branch updates (`ng <ref> non-fast-forward`) |
@@ -72,6 +73,40 @@ production nodes), so perf points will move; the conformance suite is byte-ident
 sealed one, so the 120/120 is the strongest signal. The only failure seen during development
 was a GraphQL parser bug (an unconsumed `:` in variable definitions) that failed 14 GraphQL
 checks on the first run; fixed and re-verified at 120/120 twice.
+
+## Post-build fix — agent-written entrypoint (2026-11-19)
+
+The official check `thinking_reproduces` failed on the original entry: `main.ts` was still the
+kit starter byte-for-byte, and no agent session had ever written a line of the entrypoint.
+`main.ts` has therefore been rewritten from scratch by an agent (commit `df31f30`), keeping the
+lifecycle contract exactly — bind port 0, POST `/register` (200/409 ok, 400/405 fatal, anything
+else retried with the same capped exponential backoff and 30 s request timeout), poll `/done`
+until `{"done": true}`, close, exit 0; exit 1 at once when `MAKEFUN_ENV_URL` is missing — and
+adding only harness-side hardening:
+
+- Startup config validation: a `MAKEFUN_ENV_URL` that does not parse as an http(s) URL now
+  fails fast with exit 1 instead of being retried forever (missing URL behaves as before).
+- Structured lifecycle logging: every transition (startup, listening, registered, done
+  received, shutdown) is written to stderr as one JSON line, alongside the unchanged plain
+  `[entry] ...` stdout lines; retry logging is throttled (first failure, then every tenth).
+- Explicit error handling on the bind path (phase-named error), the register path (a dedicated
+  refusal error for contract answers), and the close path (bounded 5 s close; a close error or
+  timeout is logged, never changes the exit code).
+- Still imports only `./app.ts`: no packages, no Node built-ins.
+
+Re-verification with the exact run B flow (sealed `program/env/server.mjs` + the real `main.ts`
+lifecycle), this session:
+
+| Run | Entrypoint | Checks | Perf |
+| --- | --- | --- | --- |
+| Baseline re-run | starter `main.ts` | **120/120, working 1** | 153/200 (push 43, clone 29, read 42, write 39) |
+| Fix run 1 | rewritten `main.ts` | **120/120, working 1** | 161/200 (push 43, clone 37, read 45, write 36) |
+| Fix run 2 | rewritten `main.ts` | **120/120, working 1** | 152/200 (push 45, clone 33, read 42, write 32) |
+
+The entry exited 0 in all three runs. Negative paths checked directly: missing, malformed and
+non-http(s) `MAKEFUN_ENV_URL` each exit 1 immediately with the problem on stderr. Perf moves
+with shared-VM load as before; no regression is attributable to the entrypoint (it is idle while
+the suite runs).
 
 ## Not implemented / deliberate limits
 
